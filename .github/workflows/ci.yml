@@ -1,0 +1,254 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+# PR runs supersede each other: only the latest push to a branch is interesting.
+# Push and tag runs NEVER cancel each other, which is why they are grouped by sha
+# rather than by ref. Each one publishes an artifact addressed by its own commit,
+# and a bundle can name any of them, so a superseded run is a build that becomes
+# unfetchable later — exactly when someone is trying to replay an old incident.
+concurrency:
+  group: >-
+    ci-${{ github.workflow }}-${{
+      github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          # Follow go.mod so dependency bumps that raise the Go requirement
+          # (like chi 5.3.0 -> go 1.23) can't drift from the workflow
+          go-version-file: 'go.mod'
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+  # Dependency CVEs + committed secrets (admin-gateway#12 / P3.2), same job as the
+  # match repo's CI. Trivy covers both on a private repo without GitHub Advanced
+  # Security; triaged findings go in .trivyignore. govulncheck adds call-graph-aware
+  # Go advisories (only flags vulnerable code that is actually reachable).
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Trivy scan (dependencies + secrets)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          ignore-unfixed: true
+
+      # govulncheck runs on the latest stable toolchain (x/vuln v1.5+ needs
+      # go >= 1.25, ahead of this module's go.mod); it still analyzes the
+      # module at its own language version. Pinned like the Trivy action.
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.5.0
+          govulncheck ./...
+
+  # Puts the admin binary in S3 under its commit sha, so the demo box deploys by
+  # downloading rather than by compiling.
+  #
+  # Why the box does not build it: it is a 15 GB machine running the live money
+  # path with the matching engine busy-spinning on pinned cores, and a compile
+  # there takes RAM and CPU from it. It cannot build this anyway — go 1.23.4
+  # installed, go.mod wants 1.25.0, toolchain download disabled. And a bundle
+  # names the buildSha that produced it, so replaying an old incident means
+  # booting that exact binary, which only works if it still exists somewhere
+  # other than a machine that has since moved on.
+  #
+  # A job here rather than its own workflow so `needs` is a real gate. Two
+  # workflows cannot depend on each other, and the alternative — re-running the
+  # tests inside a publish workflow — gates on a second opinion rather than on
+  # the run that actually guards main.
+  publish:
+    needs: [build, security]
+    # Opt-in per repo. Publishing needs an S3 bucket and an OIDC role that do not
+    # exist in a fresh clone or a fork, and a workflow that hard-fails on absent
+    # infrastructure turns main red for a reason unrelated to the code. Turn it on
+    # with: gh variable set ARTIFACT_PUBLISH --body true
+    if: github.event_name == 'push' && vars.ARTIFACT_PUBLISH == 'true'
+    # One publish at a time per repo, the next one queues. Serialising the writes
+    # is what keeps them ordered.
+    #
+    # Worth knowing the limit: GitHub keeps ONE pending run per group, so a third
+    # publish arriving while one runs and one waits displaces the waiting one.
+    # That is why the pointer move below is also written to only ever go forward,
+    # rather than trusting the queue to deliver in order.
+    concurrency:
+      group: publish-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC: no long-lived AWS keys in this repo
+    env:
+      BUCKET: openexch-build-artifacts-675715936685
+      ARTIFACT: admin-core
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+
+      # ARM64, not the runner's x86. The box is an m7g (Graviton), and a binary
+      # for the wrong architecture fails neither at build time nor at upload
+      # time — it fails with "cannot execute binary file" during the restart,
+      # after the old binary has already been swapped away.
+      - name: Build for the box
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+            go build -trimpath -o "$ARTIFACT" .
+
+      - name: Verify the architecture before anyone deploys it
+        run: |
+          file "$ARTIFACT"
+          file "$ARTIFACT" | grep -q "ARM aarch64" || {
+            echo "::error::built for the wrong architecture; the box is aarch64"
+            exit 1
+          }
+
+      # Where this build belongs. A branch push is addressed by commit sha and is
+      # fetchable but not deployable in production; a tag push is addressed by
+      # the tag under releases/ and is the only thing the release channel will
+      # install. Both are published: replaying an old incident needs the commit
+      # build that produced its state, whether or not it was ever released.
+      - name: Work out where this build belongs
+        id: dest
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "prefix=${ARTIFACT}/releases/${TAG}" >> "$GITHUB_OUTPUT"
+            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prefix=${ARTIFACT}/${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Stamped once here and reused, so the value in the manifest is the same
+          # one the pointer comparison sorts on. Two calls to date would be two
+          # different answers to "when was this built".
+          echo "builtAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::675715936685:role/openexch-ci-artifact-publisher
+          aws-region: eu-central-1
+
+      # Payload first, manifest last. The same commit-marker discipline the
+      # ledger archive uses: S3 has no atomic multi-object write, so until the
+      # manifest lands the prefix is an upload in progress and the box must
+      # refuse to deploy from it.
+      - name: Publish
+        env:
+          DEST: ${{ steps.dest.outputs.prefix }}
+          TAG: ${{ steps.dest.outputs.tag }}
+          BUILT_AT: ${{ steps.dest.outputs.builtAt }}
+        run: |
+          set -euo pipefail
+          PREFIX="s3://${BUCKET}/${DEST}"
+          SUM=$(sha256sum "$ARTIFACT" | cut -d' ' -f1)
+          BYTES=$(stat -c%s "$ARTIFACT")
+
+          aws s3 cp "$ARTIFACT" "${PREFIX}/${ARTIFACT}" \
+            --checksum-algorithm SHA256 --no-progress
+
+          # The tag field is what makes a release prefix self-describing. The box
+          # refuses a release prefix whose manifest carries no tag, which is how a
+          # per-commit build copied into releases/ gets caught instead of
+          # deployed.
+          cat > manifest.json <<EOF
+          {
+            "repo": "${ARTIFACT}",
+            "sha": "${GITHUB_SHA}",
+            "shortSha": "$(git rev-parse --short HEAD)",
+            "ref": "${GITHUB_REF}",
+            "tag": "${TAG}",
+            "builtAt": "${BUILT_AT}",
+            "runId": "${GITHUB_RUN_ID}",
+            "artifacts": [
+              {"name": "${ARTIFACT}", "sha256": "${SUM}", "bytes": ${BYTES},
+               "goos": "linux", "goarch": "arm64"}
+            ]
+          }
+          EOF
+          aws s3 cp manifest.json "${PREFIX}/manifest.json" --no-progress
+
+      # A publish step that cannot tell "uploaded" from "did nothing" is a step
+      # that says yes. cluster-kit's first publish reported success having
+      # uploaded nothing, and only the consumers' builds noticed.
+      - name: Verify the upload landed
+        env:
+          DEST: ${{ steps.dest.outputs.prefix }}
+        run: |
+          set -euo pipefail
+          aws s3 cp "s3://${BUCKET}/${DEST}/${ARTIFACT}" ./roundtrip --no-progress
+          diff <(sha256sum < "$ARTIFACT") <(sha256sum < ./roundtrip)
+
+      # Branch pushes only. The pointer moves after the payload is verified
+      # readable, so "latest" can never name a prefix that is not fully there.
+      #
+      # Releases deliberately have NO pointer: the newest release is computed by
+      # listing the prefixes. A pointer would be moved by whichever run finished
+      # last, and two tags' runs can finish out of order, which would leave the
+      # release channel installing an older version than it had.
+      - name: Move the latest pointer
+        if: steps.dest.outputs.release == 'false'
+        env:
+          BUILT_AT: ${{ steps.dest.outputs.builtAt }}
+        run: |
+          set -euo pipefail
+
+          # Compare before writing. Serialising publishes makes them ordered in
+          # the common case, but a displaced pending run or a retried old one can
+          # still arrive late, and a pointer that went backwards would hand the
+          # box an older build than it already had. ISO-8601 UTC sorts
+          # lexicographically, so the string comparison IS a time comparison.
+          CURRENT=$(aws s3 cp "s3://${BUCKET}/${ARTIFACT}/latest" - 2>/dev/null || true)
+          if [ -n "$CURRENT" ] && [ "$CURRENT" != "${GITHUB_SHA}" ]; then
+            CURRENT_AT=$(aws s3 cp "s3://${BUCKET}/${ARTIFACT}/${CURRENT}/manifest.json" - \
+              2>/dev/null | jq -r '.builtAt // ""' || true)
+            if [ -n "$CURRENT_AT" ] && [ "$CURRENT_AT" \> "$BUILT_AT" ]; then
+              echo "latest already names ${CURRENT} built at ${CURRENT_AT}, which is newer than"
+              echo "this build (${BUILT_AT}); leaving the pointer alone."
+              exit 0
+            fi
+          fi
+
+          printf '%s' "${GITHUB_SHA}" > latest
+          aws s3 cp latest "s3://${BUCKET}/${ARTIFACT}/latest" \
+            --content-type text/plain --no-progress
+
+      - name: Say what was published
+        env:
+          DEST: ${{ steps.dest.outputs.prefix }}
+        run: echo "published s3://${BUCKET}/${DEST}"

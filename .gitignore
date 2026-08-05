@@ -1,0 +1,51 @@
+# Compiled binary
+admin-gateway
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Go coverage
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Cloudflare Wrangler
+.wrangler/
+
+# Environment
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Self-update artifacts (rebuild-admin)
+admin-gateway.prev
+admin-gateway.staging
+rebuild-pending.json
+rebuild-result.json
+.tools/
+
+# Runtime state (live active profile, written by profile switch)
+active-profile.json
+
+# Runtime state (per-cluster node counts, written by the topology op)
+cluster-topology.json
+
+# Runtime state (operator-defined custom profiles)
+custom-profiles.json
+
+# Runtime output: the operator intent this gateway reconciles to on boot.
+# Per box, never shared. Committing one hands another machine somebody
+# else s idea of what should be running.
+desired-state.json
+.claude/
