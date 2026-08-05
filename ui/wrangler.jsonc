@@ -1,0 +1,56 @@
+// Admin console Worker: serves the built admin UI (ui/dist) and reverse-proxies
+// the API backends at the SAME origin (admin.openexchange.dev), so there is no CORS.
+// Sits behind Cloudflare Access (human auth) configured in the dashboard.
+//
+// Deploy:
+//   npm run build            # vite -> ./dist
+//   npm run deploy           # wrangler deploy (uploads dist + the Worker)
+//
+// One-time Cloudflare setup (dashboard, NOT in this file) — the console is a
+// dormant, unreachable Worker until ALL of these are done TOGETHER, because the
+// admin gateway (:8082) runs loopback-only with no bearer token on the demo box,
+// so an unauthenticated admin-api origin = the 2026-07-13 P0 (cluster admin API
+// open to the internet). Do not add DNS for admin.openexchange.dev until Access
+// is in front of it.
+//   1. Origin reachability for the gateway: point a PROXIED DNS record
+//        admin-api.openexchange.dev -> the demo box (35.158.202.101, same as
+//        oms./market.), and re-add the Caddy site block for it (removed on
+//        2026-07-24 to close the exposure). ONLY do this once step 3 is set.
+//   2. DNS + route for the console: add a proxied record for
+//        admin.openexchange.dev so the `routes` entry below goes live.
+//   3. Gateway auth: set ADMIN_AUTH_TOKEN(_FILE) on the admin gateway so it
+//        enforces 401 on the admin-api origin, then set the SAME value as this
+//        Worker's ADMIN_API_TOKEN secret (the Worker presents it as X-Admin-Token).
+//   4. Cloudflare Access: App on `admin.openexchange.dev` with an email/SSO
+//        policy (humans). <-- the P0 fix.
+//   5. Secrets:  wrangler secret put ADMIN_API_TOKEN   # = the gateway's ADMIN_AUTH_TOKEN
+//                wrangler secret put OMS_ADMIN_TOKEN    # = OMS bearer for the risk tab
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "admin-console",
+  "main": "worker/index.ts",
+  "compatibility_date": "2025-10-11",
+  "workers_dev": false, // no public workers.dev URL: admin is reachable ONLY via admin.openexchange.dev behind Access
+  "observability": { "enabled": true },
+
+  // Serve the Vite build as static assets; run the Worker first so it can
+  // intercept /api/* before the asset router, and fall back to the SPA shell
+  // for client-side routes.
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+
+  // Dormant until a proxied DNS record for admin.openexchange.dev exists AND
+  // Cloudflare Access is in front of it (see header, steps 2 + 4).
+  "routes": [{ "pattern": "admin.openexchange.dev/*", "zone_name": "openexchange.dev" }],
+
+  // Non-secret origins. admin-api.openexchange.dev must be a proxied record to
+  // the demo box with the Caddy block re-added AND the gateway token set first.
+  "vars": {
+    "ADMIN_GATEWAY_ORIGIN": "https://admin-api.openexchange.dev",
+    "OMS_ORIGIN": "https://oms.openexchange.dev"
+  }
+}

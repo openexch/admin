@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0c1017" />
+
+    <!-- No-flash theme: follow the OS color-scheme preference by default; an
+         explicit stored override (shared with the trading UI + website under
+         key `oe-theme`) wins. Runs before paint to avoid a flash of the wrong
+         theme. -->
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('oe-theme');
+          if (t !== 'light' && t !== 'dark') {
+            t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+          }
+          document.documentElement.classList.toggle('dark', t === 'dark');
+          document.documentElement.style.colorScheme = t;
+        } catch (e) {}
+      })();
+    </script>
+    <!-- Fonts are self-hosted via @fontsource imports in src/main.tsx. -->
+    <title>Open Exchange Admin</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+# PR runs supersede each other: only the latest push to a branch is interesting.
+# Push and tag runs are grouped by sha rather than by ref so they never cancel
+# each other.
+concurrency:
+  group: >-
+    ci-${{ github.workflow }}-${{
+      github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          # Follow go.mod so dependency bumps that raise the Go requirement
+          # (like chi 5.3.0 -> go 1.23) can't drift from the workflow
+          go-version-file: 'go.mod'
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+  # Dependency CVEs + committed secrets (admin-gateway#12 / P3.2), same job as the
+  # match repo's CI. Trivy covers both on a private repo without GitHub Advanced
+  # Security; triaged findings go in .trivyignore. govulncheck adds call-graph-aware
+  # Go advisories (only flags vulnerable code that is actually reachable).
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Trivy scan (dependencies + secrets)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          ignore-unfixed: true
+
+      # govulncheck runs on the latest stable toolchain (x/vuln v1.5+ needs
+      # go >= 1.25, ahead of this module's go.mod); it still analyzes the
+      # module at its own language version. Pinned like the Trivy action.
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.5.0
+          govulncheck ./...
