@@ -1205,14 +1205,35 @@ func (pm *ProcessManager) stopProcess(name string, force bool) error {
 }
 
 func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
-	if proc.cmd == nil {
+	// Capture the cmd this monitor is responsible for. A monitor belongs to ONE
+	// incarnation: if the process is stopped and restarted (or crashes and
+	// auto-restarts) while this goroutine is blocked in Wait, proc.cmd is
+	// swapped to the NEW incarnation's cmd. Without this guard the stale monitor
+	// would, after Wait returns, clobber the live incarnation's state — marking
+	// it not-running, zeroing its pid, closing its log file, deleting its pid
+	// file and running the crash protocol (a phantom crash + duplicate start).
+	proc.mu.Lock()
+	cmd := proc.cmd
+	proc.mu.Unlock()
+	if cmd == nil {
 		return
 	}
+	waitPid := cmd.Process.Pid
 
-	// Wait for process to exit
-	err := proc.cmd.Wait()
+	// Wait for the process WE captured to exit (never the newer incarnation's).
+	err := cmd.Wait()
 
 	proc.mu.Lock()
+	if proc.cmd != cmd || proc.pid != waitPid {
+		// Incarnation moved on while we were in Wait: the tracked cmd/pid now
+		// belongs to a newer (live) process. Bail out without touching its
+		// state — no not-running mark, no pid zeroing, no log close, no pid-file
+		// removal, no phantom crash, no duplicate restart.
+		proc.mu.Unlock()
+		pm.log.Info("stale monitor: incarnation superseded, leaving live state intact",
+			"service", def.Name, "waited_pid", waitPid, "tracked_pid", proc.pid)
+		return
+	}
 	wasRunning := proc.running
 	stopChan := proc.stopChan
 	proc.running = false
