@@ -2,6 +2,8 @@
 package services
 
 import (
+	"context"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +12,22 @@ import (
 
 	"github.com/openexch/admin/logging"
 )
+
+type reviewCrashHandler struct {
+	entered chan struct{}
+	resume  chan struct{}
+}
+
+func (h *reviewCrashHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *reviewCrashHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *reviewCrashHandler) WithGroup(string) slog.Handler            { return h }
+func (h *reviewCrashHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == "service crashed" {
+		close(h.entered)
+		<-h.resume
+	}
+	return nil
+}
 
 // Regression: a monitor goroutine belongs to ONE process incarnation.
 //
@@ -76,7 +94,7 @@ func TestMonitorStaleIncarnationDoesNotClobberLiveState(t *testing.T) {
 	proc.mu.Unlock()
 
 	def := ServiceDef{Name: "svc", AutoRestart: false}
-	pm.monitor(def, proc)
+	pm.monitor(def, proc, stale, stale.Process.Pid)
 
 	proc.mu.Lock()
 	defer proc.mu.Unlock()
@@ -99,5 +117,56 @@ func TestMonitorStaleIncarnationDoesNotClobberLiveState(t *testing.T) {
 	}
 	if got := pm.readPID("svc"); got != live.Process.Pid {
 		t.Errorf("stale monitor removed the live pid file: readPID = %d, want %d", got, live.Process.Pid)
+	}
+}
+
+// Pause the old monitor after its incarnation guard has passed, while crash
+// logging runs outside proc.mu. A replacement can be installed in this gap.
+func TestReviewRestartAfterIncarnationCheckPreservesLiveState(t *testing.T) {
+	handler := &reviewCrashHandler{entered: make(chan struct{}), resume: make(chan struct{})}
+	stale := exec.Command("true")
+	if err := stale.Start(); err != nil {
+		t.Fatal(err)
+	}
+	proc := &managedProcess{cmd: stale, pid: stale.Process.Pid, running: true,
+		status: "running", stopChan: make(chan struct{})}
+	pm := &ProcessManager{log: slog.New(handler), logDir: t.TempDir(),
+		pidDir: t.TempDir(), procs: map[string]*managedProcess{"svc": proc}}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		pm.monitor(ServiceDef{Name: "svc"}, proc, stale, stale.Process.Pid)
+	}()
+	select {
+	case <-handler.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("monitor did not reach crash logging")
+	}
+	live := exec.Command("sleep", "30")
+	if err := live.Start(); err != nil {
+		close(handler.resume)
+		t.Fatal(err)
+	}
+	defer func() {
+		live.Process.Kill()
+		live.Wait()
+	}()
+	proc.mu.Lock()
+	proc.cmd, proc.pid, proc.running, proc.status = live, live.Process.Pid, true, "running"
+	proc.stopChan = make(chan struct{})
+	proc.lastError = ""
+	proc.mu.Unlock()
+	pm.writePID("svc", live.Process.Pid)
+	close(handler.resume)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("monitor did not return")
+	}
+	proc.mu.Lock()
+	defer proc.mu.Unlock()
+	if proc.status != "running" || !proc.running || proc.pid != live.Process.Pid || proc.lastError != "" || len(proc.crashTimes) != 0 {
+		t.Fatalf("old monitor overwrote new live incarnation: status=%q running=%v pid=%d error=%q crashes=%d",
+			proc.status, proc.running, proc.pid, proc.lastError, len(proc.crashTimes))
 	}
 }

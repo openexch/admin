@@ -1074,7 +1074,7 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 	pm.emitEvent(agent.EventStarted, def.Name, proc.pid, "")
 
 	// Monitor process in background (handles crash + auto-restart)
-	go pm.monitor(def, proc)
+	go pm.monitor(def, proc, cmd, proc.pid)
 
 	return nil
 }
@@ -1204,21 +1204,10 @@ func (pm *ProcessManager) stopProcess(name string, force bool) error {
 	return nil
 }
 
-func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
-	// Capture the cmd this monitor is responsible for. A monitor belongs to ONE
-	// incarnation: if the process is stopped and restarted (or crashes and
-	// auto-restarts) while this goroutine is blocked in Wait, proc.cmd is
-	// swapped to the NEW incarnation's cmd. Without this guard the stale monitor
-	// would, after Wait returns, clobber the live incarnation's state — marking
-	// it not-running, zeroing its pid, closing its log file, deleting its pid
-	// file and running the crash protocol (a phantom crash + duplicate start).
-	proc.mu.Lock()
-	cmd := proc.cmd
-	proc.mu.Unlock()
+func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess, cmd *exec.Cmd, waitPid int) {
 	if cmd == nil {
 		return
 	}
-	waitPid := cmd.Process.Pid
 
 	// Wait for the process WE captured to exit (never the newer incarnation's).
 	err := cmd.Wait()
@@ -1229,9 +1218,10 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 		// belongs to a newer (live) process. Bail out without touching its
 		// state — no not-running mark, no pid zeroing, no log close, no pid-file
 		// removal, no phantom crash, no duplicate restart.
+		trackedPID := proc.pid
 		proc.mu.Unlock()
 		pm.log.Info("stale monitor: incarnation superseded, leaving live state intact",
-			"service", def.Name, "waited_pid", waitPid, "tracked_pid", proc.pid)
+			"service", def.Name, "waited_pid", waitPid, "tracked_pid", trackedPID)
 		return
 	}
 	wasRunning := proc.running
@@ -1244,15 +1234,18 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 		proc.logFile.Close()
 		proc.logFile = nil
 	}
-	proc.mu.Unlock()
-
 	pm.removePID(def.Name)
+	proc.mu.Unlock()
 
 	// Check if this was an intentional stop
 	select {
 	case <-stopChan:
 		// Intentional stop — don't restart
 		proc.mu.Lock()
+		if proc.cmd != cmd {
+			proc.mu.Unlock()
+			return
+		}
 		proc.status = "stopped"
 		proc.mu.Unlock()
 		pm.log.Info("service stopped intentionally", "service", def.Name, "pid", oldPid)
@@ -1264,6 +1257,10 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 	select {
 	case <-pm.stopChan:
 		proc.mu.Lock()
+		if proc.cmd != cmd {
+			proc.mu.Unlock()
+			return
+		}
 		proc.status = "stopped"
 		proc.mu.Unlock()
 		return
@@ -1277,7 +1274,7 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 	if !wasRunning {
 		exitMsg += " (was not marked running)"
 	}
-	pm.handleCrash(def, proc, oldPid, exitMsg, stopChan)
+	pm.handleCrash(def, proc, cmd, waitPid, oldPid, exitMsg, stopChan)
 }
 
 // handleCrash runs the shared post-crash protocol: lastError capture, rapid
@@ -1287,7 +1284,7 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 // channel never fires in a select, and the pre-restart status re-check covers
 // cancellation for adopted processes).
 func (pm *ProcessManager) handleCrash(
-	def ServiceDef, proc *managedProcess, oldPid int, exitMsg string, stopChan chan struct{}) {
+	def ServiceDef, proc *managedProcess, cmd *exec.Cmd, waitPid, oldPid int, exitMsg string, stopChan chan struct{}) {
 
 	crashCause := fmt.Sprintf("crashed (exit: %s)", exitMsg)
 	if tail := tailLogSnippet(filepath.Join(pm.logDir, def.Name+".log")); tail != "" {
@@ -1299,6 +1296,10 @@ func (pm *ProcessManager) handleCrash(
 	// sliding window, not lifetime restarts.
 	now := time.Now()
 	proc.mu.Lock()
+	if cmd != nil && proc.cmd != cmd {
+		proc.mu.Unlock()
+		return
+	}
 	kept := proc.crashTimes[:0]
 	for _, t := range proc.crashTimes {
 		if now.Sub(t) < rapidCrashWindow {
@@ -1333,6 +1334,10 @@ func (pm *ProcessManager) handleCrash(
 			msg := fmt.Sprintf("crash-looped %d times within %s; auto-restart disarmed — fix the cause, then start explicitly. Last crash: %s",
 				rapidCrashes, rapidCrashWindow, crashCause)
 			proc.mu.Lock()
+			if cmd != nil && proc.cmd != cmd {
+				proc.mu.Unlock()
+				return
+			}
 			proc.status = "failed"
 			proc.lastError = msg
 			proc.mu.Unlock()
@@ -1347,6 +1352,10 @@ func (pm *ProcessManager) handleCrash(
 		}
 
 		proc.mu.Lock()
+		if cmd != nil && proc.cmd != cmd {
+			proc.mu.Unlock()
+			return
+		}
 		proc.status = "restarting"
 		proc.mu.Unlock()
 
@@ -1364,7 +1373,7 @@ func (pm *ProcessManager) handleCrash(
 		// cancelled the restart (status left "restarting" — the only stopChan
 		// equivalent adopted processes have).
 		proc.mu.Lock()
-		if proc.starting || proc.running || proc.status != "restarting" {
+		if cmd != nil && proc.cmd != cmd || proc.starting || proc.running || proc.status != "restarting" {
 			state := proc.status
 			if proc.running {
 				state = "running"
@@ -1376,13 +1385,18 @@ func (pm *ProcessManager) handleCrash(
 			return
 		}
 		proc.restartCount++
+		restartCount := proc.restartCount
 		proc.mu.Unlock()
 
-		pm.log.Warn("auto-restarting service", "service", def.Name, "attempt", proc.restartCount)
+		pm.log.Warn("auto-restarting service", "service", def.Name, "attempt", restartCount)
 		// Use startProcessNoRotate to preserve crash logs
 		if err := pm.startProcessNoRotate(def); err != nil {
 			pm.log.Error("failed to restart service", "service", def.Name, "err", err)
 			proc.mu.Lock()
+			if cmd != nil && proc.cmd != cmd {
+				proc.mu.Unlock()
+				return
+			}
 			proc.status = "failed"
 			proc.lastError = fmt.Sprintf("auto-restart failed: %v", err)
 			proc.mu.Unlock()
@@ -1905,7 +1919,7 @@ func (pm *ProcessManager) refreshAdoptedProcesses() {
 		def := def // capture per-iteration copy for the goroutine
 		// Run the crash protocol off the poller goroutine — it sleeps
 		// RestartSec (and cascades) before restarting.
-		go pm.handleCrash(def, proc, pid, "adopted process died (no exit status available)", nil)
+		go pm.handleCrash(def, proc, nil, 0, pid, "adopted process died (no exit status available)", nil)
 	}
 }
 
