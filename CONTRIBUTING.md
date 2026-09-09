@@ -39,8 +39,8 @@ secret scanning.
 
 - **One logical change per PR.** Each PR is squash-merged into exactly one
   commit on `main` (linear history).
-- **Sign your commits.** `main` requires signed commits; unsigned PR heads
-  cannot be merged.
+- **Commit signing is optional.** Signed and unsigned contributions are
+  welcome. Review and testing expectations are unchanged.
 - Commit/PR title style: `type: imperative summary` with types
   `feat|fix|docs|test|ci|chore`.
 
