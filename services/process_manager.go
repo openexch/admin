@@ -1079,7 +1079,44 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 	return nil
 }
 
+// ownsIncarnation reports whether proc still tracks cmd. A nil cmd is the
+// adopted-process path, which has no incarnation pointer to compare.
+func ownsIncarnation(proc *managedProcess, cmd *exec.Cmd) bool {
+	if proc == nil {
+		return false
+	}
+	proc.mu.Lock()
+	defer proc.mu.Unlock()
+	return cmd == nil || proc.cmd == cmd
+}
+
+// cascadeStopDependent stops a crash-cascade target only if owner still tracks
+// ownerCmd. stale is true when that incarnation has been replaced, so the old
+// crash handler must exit without further lifecycle side effects.
+func (pm *ProcessManager) cascadeStopDependent(target, from string, owner *managedProcess, ownerCmd *exec.Cmd) (stale bool, err error) {
+	if !ownsIncarnation(owner, ownerCmd) {
+		return true, nil
+	}
+	pm.emitEvent(agent.EventCascadeStop, target, 0, "cascade from "+from)
+	if !ownsIncarnation(owner, ownerCmd) {
+		return true, nil
+	}
+	err = pm.stopProcessOwned(target, true, owner, ownerCmd)
+	if !ownsIncarnation(owner, ownerCmd) {
+		return true, nil
+	}
+	return false, err
+}
+
 func (pm *ProcessManager) stopProcess(name string, force bool) error {
+	return pm.stopProcessOwned(name, force, nil, nil)
+}
+
+func (pm *ProcessManager) stopProcessOwned(name string, force bool, owner *managedProcess, ownerCmd *exec.Cmd) error {
+	if owner != nil && !ownsIncarnation(owner, ownerCmd) {
+		return nil
+	}
+
 	proc := pm.proc(name)
 	if proc == nil {
 		return fmt.Errorf("unknown service %s (removed by a catalog reload?)", name)
@@ -1110,6 +1147,15 @@ func (pm *ProcessManager) stopProcess(name string, force bool) error {
 	}
 
 	proc.mu.Lock()
+	if owner != nil {
+		owner.mu.Lock()
+		stale := ownerCmd != nil && owner.cmd != ownerCmd
+		owner.mu.Unlock()
+		if stale {
+			proc.mu.Unlock()
+			return nil
+		}
+	}
 
 	// Always cancel pending auto-restarts, even if process appears stopped
 	if proc.stopChan != nil {
@@ -1325,16 +1371,18 @@ func (pm *ProcessManager) handleCrash(
 		// Crash cascade (media driver → node): the node's shared-memory IPC died with
 		// the driver, so stop it BEFORE restarting the driver. It is started again
 		// below once the driver is back, giving deterministic driver-then-node order.
+		//
+		// The "force-stopping dependent" log is emitted while proc.mu is not held so a
+		// replacement can land in that window (see TestReviewStaleCascade). Side
+		// effects after that log must observe incarnation again; a check-then-log-then-
+		// stop sequence still kills the recovered dependent.
 		for _, target := range def.RestartCascades {
-			proc.mu.Lock()
-			if cmd != nil && proc.cmd != cmd {
-				proc.mu.Unlock()
+			pm.log.Warn("force-stopping dependent after crash", "service", def.Name, "dependent", target)
+			stale, err := pm.cascadeStopDependent(target, def.Name, proc, cmd)
+			if stale {
 				return
 			}
-			proc.mu.Unlock()
-			pm.log.Warn("force-stopping dependent after crash", "service", def.Name, "dependent", target)
-			pm.emitEvent(agent.EventCascadeStop, target, 0, "cascade from "+def.Name)
-			if err := pm.stopProcess(target, true); err != nil {
+			if err != nil {
 				pm.log.Error("failed to stop dependent during crash cascade", "dependent", target, "service", def.Name, "err", err)
 			}
 		}
