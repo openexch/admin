@@ -1074,12 +1074,49 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 	pm.emitEvent(agent.EventStarted, def.Name, proc.pid, "")
 
 	// Monitor process in background (handles crash + auto-restart)
-	go pm.monitor(def, proc)
+	go pm.monitor(def, proc, cmd, proc.pid)
 
 	return nil
 }
 
+// ownsIncarnation reports whether proc still tracks cmd. A nil cmd is the
+// adopted-process path, which has no incarnation pointer to compare.
+func ownsIncarnation(proc *managedProcess, cmd *exec.Cmd) bool {
+	if proc == nil {
+		return false
+	}
+	proc.mu.Lock()
+	defer proc.mu.Unlock()
+	return cmd == nil || proc.cmd == cmd
+}
+
+// cascadeStopDependent stops a crash-cascade target only if owner still tracks
+// ownerCmd. stale is true when that incarnation has been replaced, so the old
+// crash handler must exit without further lifecycle side effects.
+func (pm *ProcessManager) cascadeStopDependent(target, from string, owner *managedProcess, ownerCmd *exec.Cmd) (stale bool, err error) {
+	if !ownsIncarnation(owner, ownerCmd) {
+		return true, nil
+	}
+	pm.emitEvent(agent.EventCascadeStop, target, 0, "cascade from "+from)
+	if !ownsIncarnation(owner, ownerCmd) {
+		return true, nil
+	}
+	err = pm.stopProcessOwned(target, true, owner, ownerCmd)
+	if !ownsIncarnation(owner, ownerCmd) {
+		return true, nil
+	}
+	return false, err
+}
+
 func (pm *ProcessManager) stopProcess(name string, force bool) error {
+	return pm.stopProcessOwned(name, force, nil, nil)
+}
+
+func (pm *ProcessManager) stopProcessOwned(name string, force bool, owner *managedProcess, ownerCmd *exec.Cmd) error {
+	if owner != nil && !ownsIncarnation(owner, ownerCmd) {
+		return nil
+	}
+
 	proc := pm.proc(name)
 	if proc == nil {
 		return fmt.Errorf("unknown service %s (removed by a catalog reload?)", name)
@@ -1110,6 +1147,15 @@ func (pm *ProcessManager) stopProcess(name string, force bool) error {
 	}
 
 	proc.mu.Lock()
+	if owner != nil {
+		owner.mu.Lock()
+		stale := ownerCmd != nil && owner.cmd != ownerCmd
+		owner.mu.Unlock()
+		if stale {
+			proc.mu.Unlock()
+			return nil
+		}
+	}
 
 	// Always cancel pending auto-restarts, even if process appears stopped
 	if proc.stopChan != nil {
@@ -1204,15 +1250,26 @@ func (pm *ProcessManager) stopProcess(name string, force bool) error {
 	return nil
 }
 
-func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
-	if proc.cmd == nil {
+func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess, cmd *exec.Cmd, waitPid int) {
+	if cmd == nil {
 		return
 	}
 
-	// Wait for process to exit
-	err := proc.cmd.Wait()
+	// Wait for the process WE captured to exit (never the newer incarnation's).
+	err := cmd.Wait()
 
 	proc.mu.Lock()
+	if proc.cmd != cmd || proc.pid != waitPid {
+		// Incarnation moved on while we were in Wait: the tracked cmd/pid now
+		// belongs to a newer (live) process. Bail out without touching its
+		// state — no not-running mark, no pid zeroing, no log close, no pid-file
+		// removal, no phantom crash, no duplicate restart.
+		trackedPID := proc.pid
+		proc.mu.Unlock()
+		pm.log.Info("stale monitor: incarnation superseded, leaving live state intact",
+			"service", def.Name, "waited_pid", waitPid, "tracked_pid", trackedPID)
+		return
+	}
 	wasRunning := proc.running
 	stopChan := proc.stopChan
 	proc.running = false
@@ -1223,15 +1280,18 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 		proc.logFile.Close()
 		proc.logFile = nil
 	}
-	proc.mu.Unlock()
-
 	pm.removePID(def.Name)
+	proc.mu.Unlock()
 
 	// Check if this was an intentional stop
 	select {
 	case <-stopChan:
 		// Intentional stop — don't restart
 		proc.mu.Lock()
+		if proc.cmd != cmd {
+			proc.mu.Unlock()
+			return
+		}
 		proc.status = "stopped"
 		proc.mu.Unlock()
 		pm.log.Info("service stopped intentionally", "service", def.Name, "pid", oldPid)
@@ -1243,6 +1303,10 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 	select {
 	case <-pm.stopChan:
 		proc.mu.Lock()
+		if proc.cmd != cmd {
+			proc.mu.Unlock()
+			return
+		}
 		proc.status = "stopped"
 		proc.mu.Unlock()
 		return
@@ -1256,7 +1320,7 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 	if !wasRunning {
 		exitMsg += " (was not marked running)"
 	}
-	pm.handleCrash(def, proc, oldPid, exitMsg, stopChan)
+	pm.handleCrash(def, proc, cmd, waitPid, oldPid, exitMsg, stopChan)
 }
 
 // handleCrash runs the shared post-crash protocol: lastError capture, rapid
@@ -1266,7 +1330,7 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 // channel never fires in a select, and the pre-restart status re-check covers
 // cancellation for adopted processes).
 func (pm *ProcessManager) handleCrash(
-	def ServiceDef, proc *managedProcess, oldPid int, exitMsg string, stopChan chan struct{}) {
+	def ServiceDef, proc *managedProcess, cmd *exec.Cmd, waitPid, oldPid int, exitMsg string, stopChan chan struct{}) {
 
 	crashCause := fmt.Sprintf("crashed (exit: %s)", exitMsg)
 	if tail := tailLogSnippet(filepath.Join(pm.logDir, def.Name+".log")); tail != "" {
@@ -1278,6 +1342,10 @@ func (pm *ProcessManager) handleCrash(
 	// sliding window, not lifetime restarts.
 	now := time.Now()
 	proc.mu.Lock()
+	if cmd != nil && proc.cmd != cmd {
+		proc.mu.Unlock()
+		return
+	}
 	kept := proc.crashTimes[:0]
 	for _, t := range proc.crashTimes {
 		if now.Sub(t) < rapidCrashWindow {
@@ -1293,13 +1361,28 @@ func (pm *ProcessManager) handleCrash(
 
 	// Auto-restart if enabled (with crash-loop cap)
 	if def.AutoRestart {
+		proc.mu.Lock()
+		if cmd != nil && proc.cmd != cmd {
+			proc.mu.Unlock()
+			return
+		}
+		proc.mu.Unlock()
+
 		// Crash cascade (media driver → node): the node's shared-memory IPC died with
 		// the driver, so stop it BEFORE restarting the driver. It is started again
 		// below once the driver is back, giving deterministic driver-then-node order.
+		//
+		// The "force-stopping dependent" log is emitted while proc.mu is not held so a
+		// replacement can land in that window (see TestReviewStaleCascade). Side
+		// effects after that log must observe incarnation again; a check-then-log-then-
+		// stop sequence still kills the recovered dependent.
 		for _, target := range def.RestartCascades {
 			pm.log.Warn("force-stopping dependent after crash", "service", def.Name, "dependent", target)
-			pm.emitEvent(agent.EventCascadeStop, target, 0, "cascade from "+def.Name)
-			if err := pm.stopProcess(target, true); err != nil {
+			stale, err := pm.cascadeStopDependent(target, def.Name, proc, cmd)
+			if stale {
+				return
+			}
+			if err != nil {
 				pm.log.Error("failed to stop dependent during crash cascade", "dependent", target, "service", def.Name, "err", err)
 			}
 		}
@@ -1312,6 +1395,10 @@ func (pm *ProcessManager) handleCrash(
 			msg := fmt.Sprintf("crash-looped %d times within %s; auto-restart disarmed — fix the cause, then start explicitly. Last crash: %s",
 				rapidCrashes, rapidCrashWindow, crashCause)
 			proc.mu.Lock()
+			if cmd != nil && proc.cmd != cmd {
+				proc.mu.Unlock()
+				return
+			}
 			proc.status = "failed"
 			proc.lastError = msg
 			proc.mu.Unlock()
@@ -1326,6 +1413,10 @@ func (pm *ProcessManager) handleCrash(
 		}
 
 		proc.mu.Lock()
+		if cmd != nil && proc.cmd != cmd {
+			proc.mu.Unlock()
+			return
+		}
 		proc.status = "restarting"
 		proc.mu.Unlock()
 
@@ -1343,7 +1434,7 @@ func (pm *ProcessManager) handleCrash(
 		// cancelled the restart (status left "restarting" — the only stopChan
 		// equivalent adopted processes have).
 		proc.mu.Lock()
-		if proc.starting || proc.running || proc.status != "restarting" {
+		if cmd != nil && proc.cmd != cmd || proc.starting || proc.running || proc.status != "restarting" {
 			state := proc.status
 			if proc.running {
 				state = "running"
@@ -1355,13 +1446,18 @@ func (pm *ProcessManager) handleCrash(
 			return
 		}
 		proc.restartCount++
+		restartCount := proc.restartCount
 		proc.mu.Unlock()
 
-		pm.log.Warn("auto-restarting service", "service", def.Name, "attempt", proc.restartCount)
+		pm.log.Warn("auto-restarting service", "service", def.Name, "attempt", restartCount)
 		// Use startProcessNoRotate to preserve crash logs
 		if err := pm.startProcessNoRotate(def); err != nil {
 			pm.log.Error("failed to restart service", "service", def.Name, "err", err)
 			proc.mu.Lock()
+			if cmd != nil && proc.cmd != cmd {
+				proc.mu.Unlock()
+				return
+			}
 			proc.status = "failed"
 			proc.lastError = fmt.Sprintf("auto-restart failed: %v", err)
 			proc.mu.Unlock()
@@ -1381,7 +1477,9 @@ func (pm *ProcessManager) handleCrash(
 		}
 	} else {
 		proc.mu.Lock()
-		proc.status = "crashed"
+		if cmd == nil || proc.cmd == cmd {
+			proc.status = "crashed"
+		}
 		proc.mu.Unlock()
 	}
 }
@@ -1884,7 +1982,7 @@ func (pm *ProcessManager) refreshAdoptedProcesses() {
 		def := def // capture per-iteration copy for the goroutine
 		// Run the crash protocol off the poller goroutine — it sleeps
 		// RestartSec (and cascades) before restarting.
-		go pm.handleCrash(def, proc, pid, "adopted process died (no exit status available)", nil)
+		go pm.handleCrash(def, proc, nil, 0, pid, "adopted process died (no exit status available)", nil)
 	}
 }
 
