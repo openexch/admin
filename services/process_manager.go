@@ -1315,10 +1315,23 @@ func (pm *ProcessManager) handleCrash(
 
 	// Auto-restart if enabled (with crash-loop cap)
 	if def.AutoRestart {
+		proc.mu.Lock()
+		if cmd != nil && proc.cmd != cmd {
+			proc.mu.Unlock()
+			return
+		}
+		proc.mu.Unlock()
+
 		// Crash cascade (media driver → node): the node's shared-memory IPC died with
 		// the driver, so stop it BEFORE restarting the driver. It is started again
 		// below once the driver is back, giving deterministic driver-then-node order.
 		for _, target := range def.RestartCascades {
+			proc.mu.Lock()
+			if cmd != nil && proc.cmd != cmd {
+				proc.mu.Unlock()
+				return
+			}
+			proc.mu.Unlock()
 			pm.log.Warn("force-stopping dependent after crash", "service", def.Name, "dependent", target)
 			pm.emitEvent(agent.EventCascadeStop, target, 0, "cascade from "+def.Name)
 			if err := pm.stopProcess(target, true); err != nil {
@@ -1416,7 +1429,9 @@ func (pm *ProcessManager) handleCrash(
 		}
 	} else {
 		proc.mu.Lock()
-		proc.status = "crashed"
+		if cmd == nil || proc.cmd == cmd {
+			proc.status = "crashed"
+		}
 		proc.mu.Unlock()
 	}
 }
