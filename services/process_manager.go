@@ -499,23 +499,22 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 
 	// Assets Engine nodes (the money ledger — a SEPARATE Aeron cluster from the
 	// matching engine), generated from the descriptor like the ME so its node
-	// count is topology-driven. The launch spec stays FIXED (not profile-derived):
-	// backoff idle + embedded driver + small heap + pinned to cores 20-23 (the
-	// sim's E-cores) so it NEVER competes with the matching engine on 0-11.
+	// count is topology-driven. Backoff idle, embedded driver and small heap stay
+	// fixed. CPU pinning follows the profile: dedicated uses cores 20-23 (the
+	// sim's E-cores); none lets the OS schedule AE on shared and small hosts.
 	// Ports 9300+, state on tmpfs; the embedded driver self-cleans.
 	aeAddresses := clusterAddresses(assetsCluster.NodeCount())
 	services = append(services, assetsCluster.NodeServiceDefs(
 		false, // embedded driver: no external driver services, ever
 		func(i int) []string {
-			return []string{
-				"/usr/bin/taskset", "-c", "20-23",
+			return append(pin("20-23"),
 				"/usr/bin/java",
 				"-XX:+UseZGC", "-XX:+ZGenerational",
 				"--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED",
 				"--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED",
 				"-Xmx512m", "-Xms512m",
 				"-jar", cfg.AssetsJar,
-			}
+			)
 		},
 		func(i int) []string { return nil }, // never invoked with external=false
 		func(i int) map[string]string {
